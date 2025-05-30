@@ -6,7 +6,7 @@ import traceback
 from io import BytesIO
 from typing import Optional, List
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, File, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
@@ -160,6 +160,23 @@ async def answer_question(data: QuestionRequest):
         return JSONResponse(content=answer)
     except Exception as e:
         print("[ERROR] API processing failed:", e)
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+# --- New API endpoint accepting image file upload ---
+@app.post("/test-api")
+async def test_with_image_file(question: str, file: UploadFile = File(...)):
+    try:
+        # Read and convert image to base64 string
+        image_bytes = await file.read()
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        # Reuse your core process
+        answer = process_question(question, image_base64)
+
+        return JSONResponse(content=answer)
+
+    except Exception as e:
+        print("[ERROR] /test-api failed:", e)
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 # --- Health check ---
