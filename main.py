@@ -1,12 +1,12 @@
 import csv
 import base64
 import time
-import os
 import json
+import traceback
 from io import BytesIO
 from typing import Optional, List
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
@@ -14,8 +14,6 @@ from dotenv import load_dotenv
 from PIL import Image
 import pytesseract
 from openai import OpenAI
-import traceback
-
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # Load environment variables
@@ -32,7 +30,7 @@ lectures = []
 
 # --- Middleware for catching all errors ---
 class CatchAllMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
+    async def dispatch(self, request: Request, call_next):
         try:
             response = await call_next(request)
             return response
@@ -40,7 +38,7 @@ class CatchAllMiddleware(BaseHTTPMiddleware):
             print("[VALIDATION ERROR]", ve.errors())
             return JSONResponse(
                 status_code=422,
-                content={"detail": ve.errors(), "body": ve.body}
+                content={"detail": ve.errors()}
             )
         except Exception as e:
             tb = traceback.format_exc()
@@ -51,6 +49,11 @@ class CatchAllMiddleware(BaseHTTPMiddleware):
             )
 
 app.add_middleware(CatchAllMiddleware)
+
+# --- Pydantic model for request ---
+class QuestionRequest(BaseModel):
+    question: str
+    image: Optional[str] = None
 
 # --- Load lecture content ---
 def load_lectures_csv(file_path="tds_lectures_content.csv"):
@@ -149,21 +152,12 @@ def process_question(question, image):
         "links": links
     }
 
-# --- Request model ---
-class QuestionRequest(BaseModel):
-    question: str
-    image: Optional[str] = None
-
 # --- Main API endpoint ---
 @app.post("/api")
 async def answer_question(data: QuestionRequest):
     try:
-        question = data.question
-        image = data.image
-
-        answer = process_question(question, image)
+        answer = process_question(data.question, data.image)
         return JSONResponse(content=answer)
-
     except Exception as e:
         print("[ERROR] API processing failed:", e)
         return JSONResponse(status_code=400, content={"error": str(e)})
