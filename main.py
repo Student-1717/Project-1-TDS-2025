@@ -1,138 +1,174 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List, Optional
-from PIL import Image
-import io
-import base64
-import pytesseract
-import openai
-import os
 import csv
-from contextlib import asynccontextmanager
+import base64
+import time
+import os
+import json
+from io import BytesIO
+from typing import Optional, List
 
-pytesseract.pytesseract.tesseract_cmd = r"C:\\Users\\91962\\AppData\\Local\\Programs\\Tesseract-OCR\\tesseract.exe"
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel
+from dotenv import load_dotenv
+from PIL import Image
+import pytesseract
+from openai import OpenAI
+import traceback
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+from starlette.middleware.base import BaseHTTPMiddleware
 
+# Load environment variables
+load_dotenv()
+
+# Initialize OpenAI client
+client = OpenAI()
+
+# Initialize FastAPI app
 app = FastAPI()
 
-class Link(BaseModel):
-    url: str
-    text: str
+# Global lectures store
+lectures = []
 
-class ResponseModel(BaseModel):
-    answer: str
-    links: List[Link]
+# --- Middleware for catching all errors ---
+class CatchAllMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        try:
+            response = await call_next(request)
+            return response
+        except RequestValidationError as ve:
+            print("[VALIDATION ERROR]", ve.errors())
+            return JSONResponse(
+                status_code=422,
+                content={"detail": ve.errors(), "body": ve.body}
+            )
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"[ERROR] Unhandled Exception: {e}\n{tb}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Internal Server Error", "details": str(e)}
+            )
 
-class QuestionRequest(BaseModel):
-    question: str
-    image: Optional[str] = None  # base64 image string optional
+app.add_middleware(CatchAllMiddleware)
 
-# Globals for data
-LECTURES = []
-DISCOURSE_POSTS = []
-
-def load_lectures():
-    global LECTURES
-    with open("tds_lectures_content.csv", encoding="utf-8") as f:
+# --- Load lecture content ---
+def load_lectures_csv(file_path="tds_lectures_content.csv"):
+    global lectures
+    lectures.clear()
+    print(f"[DEBUG] Loading lectures from {file_path}")
+    with open(file_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        LECTURES = [(row["Lecture Title"], row["Content"]) for row in reader]
+        for row in reader:
+            lectures.append({
+                "title": row["Lecture Title"],
+                "content": row["Content"]
+            })
+    print(f"[DEBUG] Loaded {len(lectures)} lectures")
 
-def load_discourse_posts():
-    global DISCOURSE_POSTS
-    with open("tds_discourse_posts.csv", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        DISCOURSE_POSTS = [(row["Topic Title"], row["Content"]) for row in reader]
+@app.on_event("startup")
+async def startup_event():
+    load_lectures_csv()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # startup
-    load_lectures()
-    load_discourse_posts()
-    print(f"Loaded {len(LECTURES)} lectures and {len(DISCOURSE_POSTS)} discourse posts.")
-    yield
-    # shutdown (if needed)
-
-app = FastAPI(lifespan=lifespan)
-
-def search_knowledge_base(query: str, top_k=3) -> List[str]:
-    combined = LECTURES + DISCOURSE_POSTS
-    query_words = query.lower().split()
-
-    def relevance(text):
-        text_lower = text.lower()
-        return sum(text_lower.count(w) for w in query_words)
-
-    scored = []
-    for title, content in combined:
-        score = relevance(title) + relevance(content)
-        if score > 0:
-            scored.append((score, f"Title: {title}\n{content[:500]}"))
-
-    scored.sort(reverse=True, key=lambda x: x[0])
-    return [text for score, text in scored[:top_k]]
-
-def ocr_from_base64(image_b64: str) -> str:
+# --- OCR ---
+def extract_text_from_image(base64_str: str) -> str:
     try:
-        image_data = base64.b64decode(image_b64)
-        image = Image.open(io.BytesIO(image_data))
-        return pytesseract.image_to_string(image)
-    except Exception:
+        image_data = base64.b64decode(base64_str)
+        image = Image.open(BytesIO(image_data))
+        text = pytesseract.image_to_string(image)
+        print(f"[DEBUG] OCR extracted text: {text.strip()}")
+        return text
+    except Exception as e:
+        print("[ERROR] OCR failed:", e)
         return ""
 
-def generate_openai_answer_with_context(question: str, context_snippets: List[str]) -> str:
-    context_text = "\n\n---\n\n".join(context_snippets)
-    prompt = (
-        f"You are a helpful TA for the Tools in Data Science course.\n\n"
-        f"Use the following reference material to answer the question:\n{context_text}\n\nQuestion: {question}"
-    )
+# --- Lecture search ---
+def find_relevant_lectures(question: str, limit=3) -> List[dict]:
+    question_lower = question.lower()
+    matches = [lec for lec in lectures if question_lower in lec["content"].lower()]
+    print(f"[DEBUG] Found {len(matches)} matching lectures")
+    return matches[:limit] if matches else lectures[:limit]
 
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful TA for the Tools in Data Science course."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        return response.choices[0].message.content.strip()
-    except Exception:
-        return "Sorry, I couldn't generate a proper answer right now."
+# --- GPT call ---
+def call_gpt(question: str, context: str, retries=4) -> str:
+    prompt = f"{context}\n\nQ: {question}\nA:"
+    for attempt in range(retries):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=500,
+                temperature=0.7,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"[ERROR] GPT retry {attempt + 1}/{retries}: {e}")
+            time.sleep(2 ** attempt)
+    return "ERROR: Failed to get response from GPT after retries."
 
-def match_links(question: str) -> List[Link]:
+# --- Core question processing ---
+def process_question(question, image):
+    if not question:
+        raise ValueError("Missing 'question' in request.")
+
+    # Step 1: OCR from base64 image
+    ocr_text = ""
+    if image:
+        try:
+            ocr_text = extract_text_from_image(image)
+            question += "\n\n" + ocr_text
+        except Exception as e:
+            print("[WARNING] Image OCR failed:", e)
+
+    # Step 2: Find relevant lectures
+    relevant_lectures = find_relevant_lectures(question)
+    context = "\n\n".join([f"{lec['title']}:\n{lec['content']}" for lec in relevant_lectures])
+
+    # Step 3: Call GPT
+    answer_text = call_gpt(question, context)
+
+    # Step 4: Dummy links
     links = []
+    for lec in relevant_lectures:
+        if "ga4" in lec["content"].lower():
+            links.append({
+                "url": "https://discourse.onlinedegree.iitm.ac.in/t/ga4-data-sourcing-discussion-thread-tds-jan-2025/165959",
+                "text": "GA4 Discussion"
+            })
+        elif "gpt-3.5" in question.lower():
+            links.append({
+                "url": "https://discourse.onlinedegree.iitm.ac.in/t/ga5-question-8-clarification/155939",
+                "text": "GA5 Clarification"
+            })
 
-    if "gpt-3.5" in question and "proxy" in question:
-        links.append(Link(
-            url="https://discourse.onlinedegree.iitm.ac.in/t/ga5-question-8-clarification/155939/4",
-            text="Use the model that’s mentioned in the question."
-        ))
-        links.append(Link(
-            url="https://discourse.onlinedegree.iitm.ac.in/t/ga5-question-8-clarification/155939/3",
-            text="Token clarification and advice from Prof. Anand"
-        ))
+    return {
+        "answer": answer_text,
+        "links": links
+    }
 
-    elif "10/10" in question and "bonus" in question:
-        links.append(Link(
-            url="https://discourse.onlinedegree.iitm.ac.in/t/ga4-data-sourcing-discussion-thread-tds-jan-2025/165959",
-            text="Score display logic on dashboard"
-        ))
+# --- Main API endpoint ---
+@app.post("/api")
+async def answer_question(request: Request):
+    try:
+        body_bytes = await request.body()
+        body_str = body_bytes.decode("utf-8")
+        print("[DEBUG] Raw request body:", body_str)
+        data = json.loads(body_str)
 
-    elif "docker" in question.lower() and "podman" in question.lower():
-        links.append(Link(
-            url="https://tds.s-anand.net/#/docker",
-            text="Docker vs Podman usage in the course"
-        ))
+        question = data.get("question")
+        image = data.get("image")
 
-    return links
+        answer = process_question(question, image)
+        return JSONResponse(content=answer)
 
-@app.post("/api", response_model=ResponseModel)
-async def answer_question(req: QuestionRequest):
-    image_text = ocr_from_base64(req.image) if req.image else ""
-    combined_query = req.question + " " + image_text
+    except Exception as e:
+        print("[ERROR] API processing failed:", e)
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
-    context_snippets = search_knowledge_base(combined_query, top_k=3)
-    answer = generate_openai_answer_with_context(req.question, context_snippets)
-    links = match_links(combined_query)
-
-    return {"answer": answer, "links": links}
+# --- Health check ---
+@app.get("/")
+async def health_check():
+    return {"message": "TDS Virtual TA API is running. Use POST /api to ask questions."}
