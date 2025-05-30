@@ -6,7 +6,7 @@ import json
 from io import BytesIO
 from typing import Optional, List
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
@@ -32,7 +32,7 @@ lectures = []
 
 # --- Middleware for catching all errors ---
 class CatchAllMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
+    async def dispatch(self, request, call_next):
         try:
             response = await call_next(request)
             return response
@@ -149,17 +149,17 @@ def process_question(question, image):
         "links": links
     }
 
+# --- Request model ---
+class QuestionRequest(BaseModel):
+    question: str
+    image: Optional[str] = None
+
 # --- Main API endpoint ---
 @app.post("/api")
-async def answer_question(request: Request):
+async def answer_question(data: QuestionRequest):
     try:
-        body_bytes = await request.body()
-        body_str = body_bytes.decode("utf-8")
-        print("[DEBUG] Raw request body:", body_str)
-        data = json.loads(body_str)
-
-        question = data.get("question")
-        image = data.get("image")
+        question = data.question
+        image = data.image
 
         answer = process_question(question, image)
         return JSONResponse(content=answer)
