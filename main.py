@@ -9,6 +9,7 @@ from typing import Optional, List
 from fastapi import FastAPI, Request, File, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware  # <-- Added import
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from PIL import Image
@@ -24,6 +25,15 @@ client = OpenAI()
 
 # Initialize FastAPI app
 app = FastAPI()
+
+# Add CORS middleware to allow all origins, headers, and methods
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],       # Allows any origin; adjust as needed for security
+    allow_credentials=True,
+    allow_methods=["*"],       # Allow all HTTP methods
+    allow_headers=["*"],       # Allow all headers
+)
 
 # Global lectures store
 lectures = []
